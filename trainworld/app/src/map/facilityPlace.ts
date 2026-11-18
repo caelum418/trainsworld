@@ -37,6 +37,37 @@ const CELL_M = 40;
 
 export interface Rect { x: number; y: number; ux: number; uy: number; hl: number; hd: number }
 
+interface ObstacleIndex {
+  cell: number;
+  near: Map<number, Int32Array>;
+  edges: Map<number, Float32Array>;
+  stations: Float32Array;
+  lines: Float32Array;
+  segments: number[];
+  grid: Map<number, number[]>;
+}
+
+/** Geometry kept in the clock worker between edits. Posted render buffers can be detached. */
+export interface FacilityCache { obstacles?: ObstacleIndex }
+
+function sameNumbers(a: Float32Array | Int32Array | undefined, b: Float32Array | Int32Array): boolean {
+  if (!a || a.length !== b.length) return false;
+  for (let i = 0; i < b.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function sameObstacles(old: ObstacleIndex, cell: number, near: Map<number, Int32Array>,
+  edges: Map<number, Float32Array>, stations: Float32Array, lines: Float32Array) {
+  if (old.cell !== cell || old.edges.size !== edges.size || old.near.size !== near.size ||
+      old.stations.length !== stations.length || old.lines.length !== lines.length) return false;
+  for (const [id, p] of edges) if (!sameNumbers(old.edges.get(id), p)) return false;
+  for (let i = 0; i < stations.length; i += 3)
+    if (old.stations[i] !== stations[i] || old.stations[i + 1] !== stations[i + 1]) return false;
+  if (!sameNumbers(old.lines, lines)) return false;
+  for (const [id, tile] of near) if (!sameNumbers(old.near.get(id), tile)) return false;
+  return true;
+}
+
 /** A station building's outline (local x, y pairs) and its members (station indices), which car parks
  * stay out of (T-2219). */
 export interface LotOutline { corners: ArrayLike<number>; members: readonly number[] }
@@ -72,11 +103,15 @@ export function placeFacilities(
   waysAt: Map<number, number[]>,
   complexOf?: ArrayLike<number>,
   outlines: readonly LotOutline[] = [],
+  cache?: FacilityCache,
 ): Float32Array {
   const flag = (i: number) => Math.round(stations[i * 3 + 2]);
   const want: number[] = [];
   for (let i = 0; i < st.length; i++) if (flag(i) & (ST_ROOM | ST_PARK)) want.push(i);
-  if (!want.length) return new Float32Array(0);
+  if (!want.length) {
+    if (cache) cache.obstacles = undefined;
+    return new Float32Array(0);
+  }
   const perM = 1 / Math.cos(st[want[0]].lat * Math.PI / 180), cell = CELL_M * perM;
   const keyOf = (i: number) => {
     const c = complexOf?.[st[i].id];
@@ -88,17 +123,7 @@ export function placeFacilities(
   for (let i = 0; i < st.length; i++) groups.get(keyOf(i))?.push(i);
 
   // segments by grid cell: x0, y0, x1, y1, owner (edge id, or -1 - station index)
-  const seg: number[] = [], grid = new Map<number, number[]>();
   const key = (cx: number, cy: number) => cx * 1_000_003 + cy;
-  const add = (x0: number, y0: number, x1: number, y1: number, owner: number) => {
-    const k = seg.length / 5;
-    seg.push(x0, y0, x1, y1, owner);
-    for (let cx = Math.floor(Math.min(x0, x1) / cell); cx <= Math.floor(Math.max(x0, x1) / cell); cx++)
-      for (let cy = Math.floor(Math.min(y0, y1) / cell); cy <= Math.floor(Math.max(y0, y1) / cell); cy++) {
-        const g = grid.get(key(cx, cy));
-        if (g) g.push(k); else grid.set(key(cx, cy), [k]);
-      }
-  };
   // only what lies near a complex with a facility: its platforms and a lot's reach past them
   // Store a 32 x 32 tile as 32 row masks. Marking a station's square then takes a few
   // word operations per row, even when many platforms cover the same cells.
@@ -117,23 +142,42 @@ export function placeFacilities(
       }
     }
   }
-  const isNear = (x: number, y: number) => {
-    const cx = Math.floor(x / cell), cy = Math.floor(y / cell);
-    const tile = near.get(key(Math.floor(cx / 32), Math.floor(cy / 32)));
-    return tile && (tile[cy & 31] & (1 << (cx & 31)));
-  };
-  // a straight run of track can be one long segment: tried a cell apart along it
-  const passesNear = (x0: number, y0: number, x1: number, y1: number) => {
-    const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0) / cell);
-    for (let j = 0; j <= n; j++) if (isNear(x0 + (x1 - x0) * j / Math.max(1, n), y0 + (y1 - y0) * j / Math.max(1, n))) return true;
-    return false;
-  };
-  for (const [id, p] of edgePts)
-    for (let k = 0; k + 5 < p.length; k += 3) if (passesNear(p[k], p[k + 1], p[k + 3], p[k + 4])) add(p[k], p[k + 1], p[k + 3], p[k + 4], id);
-  for (let i = 0; i < st.length; i++) {
-    const x = stations[i * 3], y = stations[i * 3 + 1], o = i * 2 * PLATFORM_POINTS;
-    if (!isNear(x, y)) continue;
-    for (let j = 0; j + 1 < PLATFORM_POINTS; j++) add(x + stationLine[o + j * 2], y + stationLine[o + j * 2 + 1], x + stationLine[o + j * 2 + 2], y + stationLine[o + j * 2 + 3], -1 - i);
+  const old = cache?.obstacles;
+  const kept = old && sameObstacles(old, cell, near, edgePts, stations, stationLine) ? old : undefined;
+  const seg = kept?.segments ?? [], grid = kept?.grid ?? new Map<number, number[]>();
+  if (!kept) {
+    const add = (x0: number, y0: number, x1: number, y1: number, owner: number) => {
+      const k = seg.length / 5;
+      seg.push(x0, y0, x1, y1, owner);
+      for (let cx = Math.floor(Math.min(x0, x1) / cell); cx <= Math.floor(Math.max(x0, x1) / cell); cx++)
+        for (let cy = Math.floor(Math.min(y0, y1) / cell); cy <= Math.floor(Math.max(y0, y1) / cell); cy++) {
+          const g = grid.get(key(cx, cy));
+          if (g) g.push(k); else grid.set(key(cx, cy), [k]);
+        }
+    };
+    const isNear = (x: number, y: number) => {
+      const cx = Math.floor(x / cell), cy = Math.floor(y / cell);
+      const tile = near.get(key(Math.floor(cx / 32), Math.floor(cy / 32)));
+      return tile && (tile[cy & 31] & (1 << (cx & 31)));
+    };
+    // a straight run of track can be one long segment: tried a cell apart along it
+    const passesNear = (x0: number, y0: number, x1: number, y1: number) => {
+      const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0) / cell);
+      for (let j = 0; j <= n; j++) if (isNear(x0 + (x1 - x0) * j / Math.max(1, n), y0 + (y1 - y0) * j / Math.max(1, n))) return true;
+      return false;
+    };
+    for (const [id, p] of edgePts)
+      for (let k = 0; k + 5 < p.length; k += 3) if (passesNear(p[k], p[k + 1], p[k + 3], p[k + 4])) add(p[k], p[k + 1], p[k + 3], p[k + 4], id);
+    for (let i = 0; i < st.length; i++) {
+      const x = stations[i * 3], y = stations[i * 3 + 1], o = i * 2 * PLATFORM_POINTS;
+      if (!isNear(x, y)) continue;
+      for (let j = 0; j + 1 < PLATFORM_POINTS; j++) add(x + stationLine[o + j * 2], y + stationLine[o + j * 2 + 1], x + stationLine[o + j * 2 + 2], y + stationLine[o + j * 2 + 3], -1 - i);
+    }
+    if (cache) {
+      const edges = new Map<number, Float32Array>();
+      for (const [id, p] of edgePts) edges.set(id, p.slice());
+      cache.obstacles = { cell, near, edges, stations: stations.slice(), lines: stationLine.slice(), segments: seg, grid };
+    }
   }
   // Many cells contain the same segment. Reuse the scratch list for consecutive
   // candidates; scoring a rectangle never invokes another segment query.
